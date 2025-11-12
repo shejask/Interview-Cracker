@@ -1,7 +1,9 @@
 "use client";
 import { useRef, useState, useEffect, useCallback, useMemo } from "react";
-import { ref, push, query, orderByChild, limitToLast, get } from "firebase/database";
+import { ref, push, query, orderByChild, limitToLast, get, set, onValue } from "firebase/database";
 import { database } from "@/firebase/config";
+import { RemoteControlListener } from "@/lib/remote-control";
+import type { RecordingState } from "@/lib/recording";
 
 export default function Home() {
   const [details, setDetails] = useState("Senior Software Engineer with 5+ years of experience in React, Node.js, and TypeScript. Specialized in building scalable web applications and microservices. Strong background in system design, database optimization, and cloud infrastructure (AWS, Docker). Passionate about clean code, testing, and mentoring junior developers.");
@@ -16,6 +18,9 @@ export default function Home() {
   const [chatHistoryError, setChatHistoryError] = useState<string>("");
   const [saveStatus, setSaveStatus] = useState<string>("");
   const [isEditingContext, setIsEditingContext] = useState(false);
+  const [isMobile, setIsMobile] = useState(false);
+  const [isRemoteMode, setIsRemoteMode] = useState(false);
+  const [remoteStatus, setRemoteStatus] = useState<"idle" | "recording" | "error">("idle");
   const recognitionRef = useRef<any>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const saveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
@@ -28,6 +33,22 @@ export default function Home() {
     const savedDetails = localStorage.getItem('jobContext');
     if (savedDetails) {
       setDetails(savedDetails);
+    }
+
+    // Detect if mobile or if SpeechRecognition is not supported
+    const hasSpeechRecognition = () => {
+      const win = window as any;
+      return !!(win.SpeechRecognition || win.webkitSpeechRecognition);
+    };
+
+    const isMobileDevice = () => {
+      return /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+    };
+
+    if (isMobileDevice() || !hasSpeechRecognition()) {
+      console.log("📱 Mobile device or no SpeechRecognition detected - enabling Remote Mode");
+      setIsMobile(true);
+      setIsRemoteMode(true);
     }
   }, []);
 
@@ -45,6 +66,36 @@ export default function Home() {
       }
     };
   }, []);
+
+  // Enable remote control listener for synchronized recording
+  useEffect(() => {
+    const sessionId = "live-session-1";
+    const controlRef = ref(database, `sessions/${sessionId}/control`);
+    
+    // Initialize control with empty state on first load
+    set(controlRef, { action: "idle", timestamp: new Date().toISOString() }).catch(e => 
+      console.warn("Could not initialize remote control:", e)
+    );
+  }, []);
+
+  // Listen for AI answer from Firebase (when desktop sends it back to mobile)
+  useEffect(() => {
+    if (!isRemoteMode) return; // Only listen on mobile
+    
+    const sessionId = "live-session-1";
+    const answerRef = ref(database, `sessions/${sessionId}/answer`);
+    
+    const unsubscribe = onValue(answerRef, (snapshot) => {
+      const data = snapshot.val();
+      if (data?.answer) {
+        console.log("📱 Mobile received AI answer from Firebase:", data.answer);
+        setAnswer(data.answer);
+        setTranscript(data.transcript || "");
+      }
+    });
+    
+    return () => unsubscribe();
+  }, [isRemoteMode]);
 
   // Optimized chat history fetcher with caching
   const fetchChatHistory = useCallback(async () => {
@@ -108,66 +159,34 @@ export default function Home() {
     }
   }, [showChatHistory, fetchChatHistory]);
 
-  // Optimized speech recognition
-  const startRecording = useCallback(() => {
-    const win = window as any;
-    const SpeechRecognition = win.SpeechRecognition || win.webkitSpeechRecognition;
-    
-    if (!SpeechRecognition) {
-      alert("SpeechRecognition not supported. Use Chrome or Edge.");
-      return;
+  // Remote control: Send commands to Firebase (for mobile)
+  const sendRemoteCommand = useCallback(async (action: "start" | "stop") => {
+    try {
+      const sessionId = "live-session-1";
+      const controlRef = ref(database, `sessions/${sessionId}/control`);
+      await set(controlRef, {
+        action,
+        timestamp: new Date().toISOString(),
+        initiatedFrom: "mobile",
+      });
+      setRemoteStatus(action === "start" ? "recording" : "idle");
+      console.log(`📱 Remote command sent to desktop: ${action}`);
+    } catch (error) {
+      console.error("Failed to send remote command:", error);
+      setRemoteStatus("error");
+      setTimeout(() => setRemoteStatus("idle"), 3000);
     }
+  }, []);
 
-    const recognition = new SpeechRecognition();
-    recognition.lang = "en-US";
-    recognition.interimResults = true;
-    recognition.continuous = true;
-
-    let currentTranscript = "";
-
-    recognition.onresult = (event: any) => {
-      let finalTranscript = "";
-      for (let i = event.resultIndex; i < event.results.length; ++i) {
-        if (event.results[i].isFinal) {
-          finalTranscript += event.results[i][0].transcript;
-        }
-      }
-      if (finalTranscript) {
-        currentTranscript += (currentTranscript ? " " : "") + finalTranscript;
-        setTranscript(currentTranscript);
-      }
-    };
-
-    recognition.onerror = () => {
-      stopRecording();
-    };
-
-    recognition.onend = () => {
-      setIsRecording(false);
-      recognitionRef.current = null;
-      if (currentTranscript.trim()) {
-        sendToAI(currentTranscript);
-      }
-    };
-
-    recognition.start();
-    recognitionRef.current = recognition;
+  const remoteStartRecording = useCallback(() => {
     setIsRecording(true);
-    setTranscript("");
-    setAnswer("Listening...");
-  }, []);
+    sendRemoteCommand("start");
+  }, [sendRemoteCommand]);
 
-  const stopRecording = useCallback(() => {
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.stop();
-      } catch (e) {
-        console.warn("Error stopping recognition", e);
-      }
-      recognitionRef.current = null;
-    }
+  const remoteStopRecording = useCallback(() => {
     setIsRecording(false);
-  }, []);
+    sendRemoteCommand("stop");
+  }, [sendRemoteCommand]);
 
   // Non-blocking Firebase save
   const saveToFirebase = useCallback(async (data: any) => {
@@ -249,6 +268,15 @@ export default function Home() {
       const responseTime = Date.now() - startTime;
       console.log(`⚡ Response received in ${responseTime}ms`);
 
+      // BROADCAST: Send answer to Firebase so mobile devices can receive it
+      const sessionId = "live-session-1";
+      const answerRef = ref(database, `sessions/${sessionId}/answer`);
+      await set(answerRef, {
+        answer: aiAnswer,
+        transcript: transcriptText,
+        timestamp: new Date().toISOString(),
+      }).catch(e => console.warn("Could not broadcast answer to Firebase:", e));
+
       // NON-BLOCKING: Save to Firebase in parallel
       setSaveStatus("💾 Saving...");
       saveToFirebase({
@@ -267,6 +295,78 @@ export default function Home() {
       setAnswer(`Error: ${msg}`);
     }
   }, [details, saveToFirebase]); // Add details as dependency
+
+  // Create recording state object for remote control listener (with sendToAI callback)
+  const recordingState: RecordingState = useMemo(() => ({
+    isRecording,
+    transcript,
+    setIsRecording,
+    setTranscript,
+    setAnswer,
+    recognitionRef,
+    sendToAI, // Include sendToAI callback so remote recording can process transcripts
+  }), [isRecording, transcript, sendToAI]);
+
+  const stopRecording = useCallback(() => {
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.stop();
+      } catch (e) {
+        console.warn("Error stopping recognition", e);
+      }
+      recognitionRef.current = null;
+    }
+    setIsRecording(false);
+  }, []);
+
+  // Optimized speech recognition
+  const startRecording = useCallback(() => {
+    const win = window as any;
+    const SpeechRecognition = win.SpeechRecognition || win.webkitSpeechRecognition;
+    
+    if (!SpeechRecognition) {
+      alert("SpeechRecognition not supported. Use Chrome or Edge.");
+      return;
+    }
+
+    const recognition = new SpeechRecognition();
+    recognition.lang = "en-US";
+    recognition.interimResults = true;
+    recognition.continuous = true;
+
+    let currentTranscript = "";
+
+    recognition.onresult = (event: any) => {
+      let finalTranscript = "";
+      for (let i = event.resultIndex; i < event.results.length; ++i) {
+        if (event.results[i].isFinal) {
+          finalTranscript += event.results[i][0].transcript;
+        }
+      }
+      if (finalTranscript) {
+        currentTranscript += (currentTranscript ? " " : "") + finalTranscript;
+        setTranscript(currentTranscript);
+      }
+    };
+
+    recognition.onerror = () => {
+      stopRecording();
+    };
+
+    recognition.onend = () => {
+      setIsRecording(false);
+      recognitionRef.current = null;
+      if (currentTranscript.trim()) {
+        sendToAI(currentTranscript);
+      }
+    };
+
+    recognition.start();
+    recognitionRef.current = recognition;
+    setIsRecording(true);
+    setTranscript("");
+    setAnswer("Listening...");
+  }, [sendToAI, stopRecording]);
 
   const handleSend = useCallback(async () => {
     if (!transcript.trim()) {
@@ -292,9 +392,14 @@ export default function Home() {
   }, []);
 
   return (
-    <main className="min-h-screen bg-[#0a0a0a] text-gray-100 p-8">
-      <div className="max-w-2xl mx-auto">
-        <div className="flex justify-between items-center mb-6">
+    <>
+      {/* Remote Control Listener - listens for remote start/stop commands */}
+      <RemoteControlListener recordingState={recordingState} sessionId="live-session-1" />
+
+      <main className="min-h-screen bg-[#0a0a0a] text-gray-100 p-8 md:p-8">
+        <div className="max-w-2xl mx-auto">
+        {/* DESKTOP HEADER - Hidden on mobile */}
+        <div className="hidden md:flex justify-between items-center mb-6">
           <h1 className="text-3xl font-bold text-white">
             🎙️ Live Interview AI
           </h1>
@@ -317,7 +422,7 @@ export default function Home() {
         </div>
 
         {saveStatus && (
-          <div className={`mb-4 p-3 rounded ${
+          <div className={`hidden md:block mb-4 p-3 rounded ${
             saveStatus.includes("✅") ? "bg-green-900/50 border border-green-700 text-green-200" :
             saveStatus.includes("⚠️") ? "bg-red-900/50 border border-red-700 text-red-200" :
             "bg-blue-900/50 border border-blue-700 text-blue-200"
@@ -395,49 +500,98 @@ export default function Home() {
           </div>
         )}
 
-        <div className="my-6">
-          <div className="flex gap-3 justify-center mb-3">
-            <button
-              onClick={isRecording ? stopRecording : startRecording}
-              disabled={!hasDetails}
-              className={`px-5 py-2 rounded font-semibold transition ${
-                isRecording
-                  ? "bg-red-600 hover:bg-red-700"
-                  : hasDetails
-                  ? "bg-green-600 hover:bg-green-700"
-                  : "bg-gray-600 cursor-not-allowed opacity-50"
-              } text-white`}
-            >
-              {isRecording ? "⏹ Stop" : "🎤 Record"}
-            </button>
+        {/* DESKTOP SECTION - Hidden on mobile */}
+        <div className="hidden md:block">
+          <div className="my-6">
+            <div className="flex gap-3 justify-center mb-3">
+              <button
+                onClick={isRemoteMode ? (isRecording ? remoteStopRecording : remoteStartRecording) : (isRecording ? stopRecording : startRecording)}
+                disabled={!hasDetails}
+                className={`px-5 py-2 rounded font-semibold transition ${
+                  isRecording
+                    ? "bg-red-600 hover:bg-red-700"
+                    : hasDetails
+                    ? "bg-green-600 hover:bg-green-700"
+                    : "bg-gray-600 cursor-not-allowed opacity-50"
+                } text-white flex items-center gap-2`}
+              >
+                {isRemoteMode && <span>📱</span>}
+                {isRecording ? "⏹ Stop" : "🎤 Record"}
+              </button>
 
+              <button
+                onClick={handleSend}
+                className="bg-blue-600 hover:bg-blue-700 text-white px-5 py-2 rounded font-semibold transition"
+              >
+                🚀 Send
+              </button>
+            </div>
+
+            {/* Remote Mode Status */}
+            {isRemoteMode && (
+              <div className={`mb-3 p-2 rounded text-sm text-center ${
+                remoteStatus === "recording" ? "bg-red-900 text-red-200" :
+                remoteStatus === "error" ? "bg-red-900 text-red-200" :
+                "bg-purple-900 text-purple-200"
+              }`}>
+                {remoteStatus === "recording" ? "🎙️ Recording on Desktop" :
+                 remoteStatus === "error" ? "❌ Connection Error" :
+                 "📱 Remote Control Mode - Commands sent to desktop"}
+              </div>
+            )}
+
+            <p className="text-sm text-gray-400 mb-1">Transcript:</p>
+            <textarea
+              value={transcript}
+              onChange={(e) => setTranscript(e.target.value)}
+              className="w-full p-3 bg-[#1a1a1a] border border-gray-700 rounded text-gray-100 focus:outline-none focus:border-blue-500"
+              rows={4}
+            />
             <button
-              onClick={handleSend}
-              className="bg-blue-600 hover:bg-blue-700 text-white px-5 py-2 rounded font-semibold transition"
+              onClick={() => setTranscript("")}
+              className="mt-2 bg-red-600 hover:bg-red-700 text-white px-3 py-1 rounded text-sm font-semibold transition"
             >
-              🚀 Send
+              🗑️ Clear
             </button>
           </div>
 
-          <p className="text-sm text-gray-400 mb-1">Transcript:</p>
-          <textarea
-            value={transcript}
-            onChange={(e) => setTranscript(e.target.value)}
-            className="w-full p-3 bg-[#1a1a1a] border border-gray-700 rounded text-gray-100 focus:outline-none focus:border-blue-500"
-            rows={4}
-          />
-          <button
-            onClick={() => setTranscript("")}
-            className="mt-2 bg-red-600 hover:bg-red-700 text-white px-3 py-1 rounded text-sm font-semibold transition"
-          >
-            🗑️ Clear
-          </button>
+          <div className="mt-8 p-5 rounded-lg bg-[#121212] border border-gray-700 shadow-lg">
+            <h2 className="text-lg font-semibold text-blue-400 mb-2">💡 AI Answer</h2>
+            <div className="whitespace-pre-wrap text-gray-100 leading-relaxed">
+              {answer || <span className="text-gray-500">Waiting...</span>}
+            </div>
+          </div>
         </div>
 
-        <div className="mt-8 p-5 rounded-lg bg-[#121212] border border-gray-700 shadow-lg">
-          <h2 className="text-lg font-semibold text-blue-400 mb-2">💡 AI Answer</h2>
-          <div className="whitespace-pre-wrap text-gray-100 leading-relaxed">
-            {answer || <span className="text-gray-500">Waiting...</span>}
+        {/* MOBILE SECTION - Full screen layout */}
+        <div className="md:hidden flex flex-col h-[calc(100vh-8rem)] pb-24">
+          {/* Remote Mode Status - Top of mobile view */}
+          {isRemoteMode && (
+            <div className={`mb-3 p-3 rounded text-center ${
+              remoteStatus === "recording" ? "bg-red-900 text-red-200" :
+              remoteStatus === "error" ? "bg-red-900 text-red-200" :
+              "bg-purple-900 text-purple-200"
+            }`}>
+              {remoteStatus === "recording" ? "🎙️ Recording on Desktop" :
+               remoteStatus === "error" ? "❌ Connection Error" :
+               "📱 Remote Control Mode"}
+            </div>
+          )}
+
+          {/* Transcript - Scrollable */}
+          <div className="flex-1 overflow-y-auto mb-4">
+            <p className="text-xs text-gray-400 mb-2">📝 Transcript:</p>
+            <div className="w-full p-3 bg-[#1a1a1a] border border-gray-700 rounded text-gray-100 text-sm leading-relaxed whitespace-pre-wrap min-h-[150px]">
+              {transcript || <span className="text-gray-500">Waiting for speech...</span>}
+            </div>
+          </div>
+
+          {/* AI Answer - Scrollable */}
+          <div className="flex-1 overflow-y-auto mb-4">
+            <p className="text-xs text-gray-400 mb-2">💡 AI Answer:</p>
+            <div className="w-full p-3 bg-[#121212] border border-gray-700 rounded text-gray-100 text-sm leading-relaxed whitespace-pre-wrap min-h-[150px]">
+              {answer || <span className="text-gray-500">Waiting...</span>}
+            </div>
           </div>
         </div>
 
@@ -526,11 +680,11 @@ export default function Home() {
           </div>
         )}
 
-        <div className="fixed bottom-6 left-1/2 transform -translate-x-1/2 flex gap-3 bg-[#1a1a1a] border border-gray-700 rounded-full px-4 py-3 shadow-lg z-40 md:hidden">
+        <div className="fixed bottom-0 left-0 right-0 md:hidden bg-gradient-to-t from-[#0a0a0a] to-[#1a1a1a] border-t border-gray-700 px-4 py-4 z-50">
           <button
-            onClick={isRecording ? stopRecording : startRecording}
+            onClick={isRemoteMode ? (isRecording ? remoteStopRecording : remoteStartRecording) : (isRecording ? stopRecording : startRecording)}
             disabled={!hasDetails}
-            className={`px-4 py-2 rounded-full font-semibold text-sm transition ${
+            className={`w-full py-4 rounded-lg font-bold text-lg transition flex items-center justify-center gap-2 ${
               isRecording
                 ? "bg-red-600 hover:bg-red-700"
                 : hasDetails
@@ -538,17 +692,12 @@ export default function Home() {
                 : "bg-gray-600 cursor-not-allowed opacity-50"
             } text-white`}
           >
-            {isRecording ? "⏹" : "🎤"}
-          </button>
-
-          <button
-            onClick={handleSend}
-            className="px-4 py-2 rounded-full font-semibold text-sm bg-blue-600 hover:bg-blue-700 text-white transition"
-          >
-            🚀
+            {isRemoteMode && <span>📱</span>}
+            {isRecording ? "⏹ Stop Recording" : "🎤 Start Recording"}
           </button>
         </div>
       </div>
     </main>
+    </>
   );
 }
